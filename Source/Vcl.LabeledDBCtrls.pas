@@ -297,6 +297,8 @@ Type
   TCBCheckBoxedColumnEvent = procedure (Column: TColumn; var IsCheckBoxedColumn: Boolean) of object;
   TColumnNotifyEvent = procedure (Column: TColumn) of object;
 
+  TGridIncrementalSearchType = (stBeginsWith, stFilterBy);
+
   TLabeledDbGrid = class(TDBGrid)
   private
     FBoundLabel: TControlBoundLabel;
@@ -319,6 +321,10 @@ Type
     FOnIsCheckBoxedColumn: TCBCheckBoxedColumnEvent;
     FLinesPerRow: Integer;
     FRowMargin: Integer;
+    FWrapAllText: Boolean;
+    FColMoving: Boolean;
+    FTitleMouseDown: boolean;
+    FIncrementalSearchType: TGridIncrementalSearchType;
     function TitleOffset: Integer;
     procedure OnSearchTimer(Sender : TObject);
     procedure SetBoundCaption(const Value: TCaption);
@@ -343,6 +349,7 @@ Type
     function isCheckBoxedField(Field: TField): boolean;
     function isUnsortableField(Field: TField): boolean;
     procedure doIncrementalLocate;
+    procedure doIncrementalFilter;
     procedure SetIncrementalSearchDelay(const Value: integer);
     function GetIncrementalSearchDelay: integer;
     procedure SetDrawCheckBoxImages(const Value: Boolean);
@@ -356,6 +363,8 @@ Type
     procedure WriteText(ACanvas: TCanvas; ARect: TRect; DX, DY: Integer;
       const AField: TField; Const AColumn: TColumn);
     function CalcRowMargin(const ARect: TRect): Integer;
+    procedure SetWrapAllText(const Value: Boolean);
+    procedure SetColMoving(const Value: Boolean);
   protected
     procedure SetParent(AParent: TWinControl); override;
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -377,12 +386,17 @@ Type
     procedure MouseMove(Shift: TShiftState; X, Y: Integer); override;
     procedure MouseDown(Button: TMouseButton; Shift: TShiftState;
       X, Y: Integer); override;
+      procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X: Integer; Y: Integer); override;
+
     function GetBorderStyle: TBorderStyle;
     {$IF DEFINE DXE8+}
     procedure ChangeScale(M, D: Integer; isDpiChange: Boolean); override;
     {$ELSE}
     procedure ChangeScale(M, D: Integer); override;
     {$ENDIF}
+
+    function  CreateColumns: TDBGridColumns; override;
+
   public
     procedure DefaultDrawColumnCell(const Rect: TRect; DataCol: Integer;
       Column: TColumn; State: TGridDrawState);
@@ -406,6 +420,8 @@ Type
     function ColumnIndexByFieldName(const AFieldName: string): Integer;
     function GetMouseOverField(X, Y: Integer): TField;
     function GetDefaultRowHeight: Integer;
+    procedure ClearFilters;
+
   published
     property TitleFont: TFont read GetTitleFont write SetTitleFont stored False;
     property IsEmpty: Boolean read GetIsEmpty;
@@ -428,6 +444,9 @@ Type
     property UnsortableFields: string read FUnsortableFields write FUnsortableFields;
     property CanEditColumn: TCBCanEditColumn read FCanEditColumn write FCanEditColumn;
     property RowMargin: Integer read FRowMargin write SetRowMargin default 0;
+    property WrapAllText: Boolean read FWrapAllText write SetWrapAllText default False;
+    property ColMoving: Boolean read FColMoving write SetColMoving default True;
+    property IncrementalSearchType: TGridIncrementalSearchType read FIncrementalSearchType write FIncrementalSearchType default stBeginsWith;
   end;
 
   TNavInsMode = (imInsert, imAppend);
@@ -446,6 +465,14 @@ uses
   DBActns, UxTheme, UITypes,
   //Labeled components
   Vcl.DbAwareLabeledUtils, Vcl.LabeledCtrls;
+  
+type
+  TXColumn = class(TColumn)
+  private
+    FTitleCaption: string;
+  public
+    property TitleCaption: string read FTitleCaption write FTitleCaption;
+  end;
 
 var
   DbGridPrintSupport: TStringList;
@@ -1045,6 +1072,27 @@ end;
 
 { TLabeledDbGrid }
 
+function TruncStringInRect(ACanvas: TCanvas; ARect: TRect; const AText: string; AOffset: Integer): string;
+const
+  DOTS = '...';
+var
+  maxDim, idx: Integer ;
+begin
+  maxDim := (ARect.Right - ARect.Left + 1) - (AOffset*2) ;
+  if ACanvas.TextWidth(AText) <= maxDim then
+    Result := AText
+  else
+    for idx := 1 to Length(AText) do
+    begin
+      Result := Copy(AText, 1, idx) + DOTS ;
+      if ACanvas.TextWidth(Result) > MaxDim then
+      begin
+        Result := Copy(AText, 1, idx-1) + DOTS ;
+        Break ;
+      end;
+    end;
+end;
+
 //Same as VCL source
 procedure TLabeledDbGrid.WriteText(ACanvas: TCanvas; ARect: TRect; DX, DY: Integer;
   const AField: TField; Const AColumn: TColumn);
@@ -1055,7 +1103,7 @@ const
       DT_CENTER or DT_WORDBREAK or DT_EXPANDTABS or DT_NOPREFIX );
   RTL: array [Boolean] of Integer = (0, DT_RTLREADING);
 var
-  Text: string;
+  Text, TruncText: string;
   Alignment: TAlignment;
   ARightToLeft: Boolean;
   B, R: TRect;
@@ -1063,6 +1111,7 @@ var
   I: TColorRef;
   LFormat: Integer;
   LMemoField: Boolean;
+  LWrapText: Boolean;
 begin
   ACanvas.Font.Name := Font.Name;
   ACanvas.Font.Style := Font.Style;
@@ -1071,14 +1120,25 @@ begin
   //Verifiy that Field is a Memofield
   LMemoField := Assigned(AField) and (AField.DataType in [ftMemo, ftFmtMemo, ftWideMemo]);
   if LMemoField then
-  begin
-    Text := AField.AsString;
-    ACanvas.FillRect(ARect);
-  end
+    Text := AField.AsString
   else if Assigned(AField) and not (FDrawCheckBoxImages and isCheckBoxedField(AField)) then //Empty Text if drawing checkbox
     Text := AField.DisplayText
   else
     Text := '';
+
+  TruncText := TruncStringInRect(Canvas, ARect, Text, DX) ;
+
+  if (LinesPerRow = 1) or (Text = TruncText) or not FWrapAllText or
+     ((Text <> TruncText) and not Text.Contains(' ')) then
+  begin
+    Text := TruncText;
+    LWrapText := False
+  end
+  else
+    LWrapText := True;
+
+  if LMemoField or LWrapText then
+    ACanvas.FillRect(ARect);
 
   Alignment := AColumn.Alignment;
   ARightToLeft := UseRightToLeftAlignmentForField(AField, AColumn.Alignment);
@@ -1100,7 +1160,7 @@ begin
         - (ACanvas.TextWidth(Text) div 2);
     end;
     //Se il campo è un memo lo stampa su n righe:
-    if LMemoField then
+    if LMemoField or LWrapText then
     begin
       LFormat := dt_WordBreak or dt_NoPrefix;
       //Riduce l'area di stampa in base ai margini
@@ -1163,10 +1223,17 @@ begin
   FDrawCheckBoxImages := True;
   FShowSortOrder := True;
   FIncrementalSearch := False;
+  FIncrementalSearchType := stBeginsWith;
   FSearchTimer := TTimer.Create(nil);
   FSearchTimer.Interval := INCREMENTAL_DELAY_DEFAULT;
   FSearchTimer.Enabled := False;
   FSearchTimer.OnTimer := OnSearchTimer;
+  FColMoving := True;
+end;
+
+function TLabeledDbGrid.CreateColumns: TDBGridColumns;
+begin
+  Result := TDBGridColumns.Create(Self, TXColumn)
 end;
 
 procedure TLabeledDbGrid.VisibleChanging;
@@ -1301,6 +1368,8 @@ var
   SortOrder: TCBSortOrder;
   LRect: TRect;
   LDataLinkActive: Boolean;
+
+  Text: string;
 begin
   dxGridSortedShapeMinWidth := ARect.Bottom - ARect.Top; //16
   //se è il record corrente aggiorno il flag in modo tale che nell'evento
@@ -1315,6 +1384,26 @@ begin
       FDrawingCurrentRecord := True
     else
       FDrawingCurrentRecord := False;
+
+    // artifizio per avere i puntini di sospensione anche in caso di troncatura del testo sul titolo
+    if not FTitleMouseDown and (gdFixed in AState) and (ACol > 0) and not(csDesigning in ComponentState) then
+    begin
+      DrawColumn := Columns[ACol];
+      Text := TXColumn(DrawColumn).TitleCaption;
+
+      if Text = '' then
+      begin
+        Text := DrawColumn.Title.Caption;
+        TXColumn(DrawColumn).TitleCaption := Text; // prima assegnazione della caption originale
+      end;
+
+      if (StrRicercaIncrementale <> '') and (SelectedIndex = ACol) then
+        Text := '[' + StrRicercaIncrementale + '] '+Text;
+
+      DrawColumn.Title.Caption := TruncStringInRect(Canvas, ARect, Text, 2) ;
+    end;
+    //--ale
+
   finally
     Inc(ACol, IndicatorOffset);
   end;
@@ -1461,6 +1550,15 @@ begin
   inherited TitleFont.Assign(Value);
 end;
 
+procedure TLabeledDbGrid.SetWrapAllText(const Value: Boolean);
+begin
+  if FWrapAllText <> Value then
+  begin
+    FWrapAllText := Value;
+    Invalidate;
+  end;
+end;
+
 procedure TLabeledDbGrid.StandardSort(Field: TField; var SortOrder: TCBSortOrder);
 var
   DataSet: TDataSet;
@@ -1574,6 +1672,9 @@ end;
 procedure TLabeledDbGrid.MouseDown(Button: TMouseButton; Shift: TShiftState; X,
   Y: Integer);
 begin
+  FTitleMouseDown := (Button = mbLeft) and (Shift = [ssLeft])
+         and isMouseOverTitleColumn(X,Y) and not Sizing(X,Y);
+
   inherited;
   if (Button = mbLeft) and (Shift = [ssLeft]) then
   begin
@@ -1730,7 +1831,11 @@ begin
           if DefaultWindowsStyleEnabled then
             CellColor := clInfoBk
           else
-            CellColor := GetCellColor;
+          //CellColor := GetCellColor;
+          begin
+            CellColor := LightenColor(GetStyledColor(clHighlight), 150);
+            Canvas.Font.Color :=LightenColor(GetStyledColor(clHighlightText), 25);
+          end;
         end
         else
           CellColor := GetCellColor;
@@ -1760,6 +1865,26 @@ begin
     end
     else
       CellColor := GetCellColor;
+  end;
+
+  if dgAlwaysShowSelection in Options then
+  begin
+    if (DataSource = nil) or (DataSource.DataSet = nil) or (DataSource.DataSet.EOF and DataSource.DataSet.BOF) then
+      Canvas.Brush.Color := GetStyledColor(Color)
+    else
+    if not Focused and ( gdSelected in State ) then
+    begin
+      if DefaultWindowsStyleEnabled then
+      begin
+        Canvas.Brush.Color := clInactiveCaption;
+        Canvas.Font.Color  := clInactiveCaptionText;
+      end
+      else
+      begin
+        Canvas.Brush.Color := LightenColor(GetStyledColor(clHighlight), 150);
+        Canvas.Font.Color  := LightenColor(GetStyledColor(clHighlightText), 25);
+      end;
+    end;
   end;
 
   // Se il tipo di dato è Boolean, mostra in alternativa alle diciture
@@ -2063,12 +2188,67 @@ begin
   FSearchTimer.Enabled := True;
 end;
 
+procedure TLabeledDbGrid.doIncrementalFilter;
+var
+  IntValue: Integer;
+  DateValue: TDateTime;
+begin
+  FSearchTimer.Enabled := False;
+
+  if (DataSource = nil) or (Datasource.DataSet = nil) or (SelectedField = nil) then
+    Exit;
+
+  Datasource.DataSet.Filtered := False;
+
+  if StrRicercaIncrementale = '' then
+    Datasource.DataSet.Filter := ''
+  else
+  begin
+    Screen.Cursor := crHourGlass;
+    Try
+      if SelectedField.InheritsFrom(TNumericField) then
+      begin
+        if TryStrToInt(StrRicercaIncrementale, IntValue) then
+          Datasource.DataSet.Filter := SelectedField.FieldName + '='+ IntValue.ToString;
+      end
+      else if SelectedField.InheritsFrom(TDateField) then
+      begin
+        if TryStrToDateTime(StrRicercaIncrementale, DateValue) then
+          Datasource.DataSet.Filter := SelectedField.FieldName + '='+ QuotedStr(DateToStr(DateValue));
+      end
+      else if SelectedField.InheritsFrom(TDateTimeField) or SelectedField.InheritsFrom(TSQLTimeStampField) then
+      begin
+        if TryStrToDateTime(StrRicercaIncrementale, DateValue) then
+          Datasource.DataSet.Filter := SelectedField.FieldName + '>='+ QuotedStr(DateTimeToStr(DateValue));
+      end
+      else
+        Datasource.DataSet.Filter := SelectedField.FieldName+ ' like ' +QuotedStr('%'+StrRicercaIncrementale+'%');
+
+      Datasource.DataSet.Filtered := True;
+    Finally
+      Screen.Cursor := crDefault;
+    End;
+  end;
+end;
+
+procedure TLabeledDbGrid.ClearFilters;
+begin
+  ChangeStrSearch('');
+  OnSearchTimer(self);
+end;
+
+
+
 procedure TLabeledDbGrid.doIncrementalLocate;
 var
   IntValue: Integer;
   DateValue: TDateTime;
 begin
   FSearchTimer.Enabled := False;
+
+  if (DataSource = nil) or (Datasource.DataSet = nil) or (SelectedField = nil) then
+    Exit;
+
   if StrRicercaIncrementale <> '' then
   begin
     Screen.Cursor := crHourGlass;
@@ -2236,6 +2416,13 @@ begin
   end;
 end;
 
+procedure TLabeledDbGrid.MouseUp(Button: TMouseButton; Shift: TShiftState;
+  X, Y: Integer);
+begin
+  FTitleMouseDown := False;
+  inherited;
+end;
+
 procedure TLabeledDbGrid.SetCheckBoxedFields(const Value: string);
 begin
   if FCheckBoxedFields <> Value then
@@ -2246,7 +2433,10 @@ end;
 
 procedure TLabeledDbGrid.OnSearchTimer(Sender: TObject);
 begin
-  doIncrementalLocate;
+  case FIncrementalSearchType of
+    stBeginsWith: doIncrementalLocate;
+    stFilterBy  : doIncrementalFilter;
+  end;
 end;
 
 procedure TLabeledDbGrid.SetIncrementalSearchDelay(const Value: integer);
@@ -2299,6 +2489,23 @@ begin
   Result := FindColumnByFieldName(OldfieldName, Column);
   if Result then
     Column.FieldName := NewFieldName;
+end;
+
+
+type
+  THackCustomGrid = class(TCustomGrid)
+  public
+    property Options;
+  end;
+
+procedure TLabeledDbGrid.SetColMoving(const Value: Boolean);
+begin
+  FColMoving := Value;
+  with THackCustomGrid(Self) do
+  if Value then
+    Options := Options + [goColMoving]
+  else
+    Options := Options - [goColMoving];
 end;
 
 { TLabeledDBLabel }
